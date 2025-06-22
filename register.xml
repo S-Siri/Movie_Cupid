@@ -1,0 +1,1327 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+  <sys_script_include action="INSERT_OR_UPDATE">
+    <access>package_private</access>
+    <active>true</active>
+    <api_name>sn_sec_splunkes.SplunkESEventIngestionQueryAbstract</api_name>
+    <caller_access/>
+    <client_callable>false</client_callable>
+    <description>This class contains the logic for querying events from splunk ES.</description>
+    <mobile_callable>false</mobile_callable>
+    <name>SplunkESEventIngestionQueryAbstract</name>
+    <sandbox_callable>false</sandbox_callable>
+    <script><![CDATA[var SplunkESEventIngestionQueryAbstract = Class.create();
+SplunkESEventIngestionQueryAbstract.prototype = {
+    SAMPLE_LIMIT: 5,
+    _COUNT: 100,
+    _SID_TTL: parseInt(gs.getProperty('sn_sec_splunkes.sid_ttl', 600)),
+    SPLUNKES_PROFILE_TABLE: 'sn_sec_splunkes_event_profile',
+    CORRELATION_RULES_TABLE: 'sn_sec_splunkes_splunk_es_correlation_rules_list',
+    EVENT_IMPORT_TABLE: 'sn_sec_splunkes_event_import',
+    COLLISION_MAPPING_TABLE: 'sn_sec_splunkes_field_collision_mapping',
+    SID_POLLING_TABLE: 'sn_sec_splunkes_splunk_es_polling_ids',
+    EVENT_TO_TASK_TABLE: 'sn_sec_splunkes_event_to_task',
+    TASK_TABLE: 'sn_si_incident',
+    LATEST_ENTRY_LIMIT_DAYS: -365, //negative value to look in the past days
+    SPLUNK_REGEX: /\$(.*?)\$/g,
+    _SECURITY_INCIDENT_LINK: "nav_to.do?uri=sn_si_incident.do?sys_id=",
+    _TOKEN_REGEX: /\${(.*?)}\$/,
+    _URL: "URL",
+    _INSTANCE_URL: gs.getProperty('glide.servlet.uri'),
+    _SPLUNK_ALERT_LIMIT: parseInt(gs.getProperty('sn_sec_splunkes.number_of_correlation_rules', 500)),
+    _DEL: gs.getProperty('sn_sec_splunkes.delimiter', ','),
+    OVERLAP_TIME: parseInt(gs.getProperty('sn_sec_splunkes.overlapping_time', 30)),
+    _SPLUNK_FIELD_VALUES_LIMIT: parseInt(gs.getProperty('sn_sec_splunkes.field_values_limit', 1000)),
+    _apiFactory: "",
+    JSONG: sn_sec_cmn.JSONGlide,
+
+    /*
+     * Takes an api factory interface implementation
+     * interface {
+     *      build(profile) api
+     * }
+     */
+    initialize: function(apiFactory) {
+        if (!this.hasApiFactory()) {
+            if (!apiFactory)
+                this.setApiFactory(new SplunkESEventIngestionApiFactory());
+            else {
+                this.setApiFactory(apiFactory);
+            }
+        }
+    },
+    setApiFactory: function(apiFactory) {
+        this._apiFactory = apiFactory;
+    },
+    getApiFactory: function() {
+        return this._apiFactory;
+    },
+    hasApiFactory: function() {
+        return !gs.nil(this._apiFactory);
+    },
+    getLastError: function(profile) {
+        return this._getLastError(profile);
+    },
+    // Methods that do not get event data
+    /*
+     * This method checks the connection to splunk
+     * and the credentials in the profile
+     */
+    testConnection: function(profile) {
+        var api = this._getSplunkApi(profile);
+        return api.testConnection();
+    },
+    /*
+     * This method does a connection to splunk
+     * and confirms the connection and credentials
+     * work
+     */
+    testCredentials: function(profile) {
+        var api = this._getSplunkApi(profile);
+        return api.testCredentials();
+    },
+    /*
+     * This method gets the list of currently created alerts
+     */
+    refreshCorrelationRules: function(profile, selectedApp) {
+        gs.debug("Invoking refreshCorrelationRules with inputs: {0}", [this.JSONG.stringify(profile)]);
+        return this._refreshCorrelationRules(profile, selectedApp);
+    },
+    // Methods used to pull in data for mapping samples
+    /*
+     * This method gets a subset of events from the splunk API
+     * uses:
+     * api.getSampleNotableEvent
+     * used: SplunkESPullSampleEvents
+     */
+    getSampleEventsSid: function(profile) {
+        gs.debug("Invoking getSampleEventsSid with inputs: {0}", [this.JSONG.stringify(profile)]);
+        var correlationRuleName = this._getCorrelationRuleNameFromProfile(profile);
+        var escapedCorrelationRuleName = this._getEscapedCorrelationRuleName(correlationRuleName);
+        var sidResponse = this._fetchSampleEventsByCorrelationRule(profile, escapedCorrelationRuleName, this.SAMPLE_LIMIT);
+        var api = this._getSplunkApi(profile);
+        return this._processSampleSID(profile, sidResponse["sid"], api);
+    },
+
+    getSampleEventsSidonAlertName: function(profile, sampletype) {
+        gs.debug("Invoking getSampleEventsSidonAlertName with inputs: {0} {1}", [this.JSONG.stringify(profile), sampletype]);
+        var correlationRuleName = this._getCorrelationRuleNameFromAlert(sampletype);
+        var escapedCorrelationRuleName = this._getEscapedCorrelationRuleName(correlationRuleName);
+        var sidResponse = this._fetchSampleEventsByCorrelationRule(profile, escapedCorrelationRuleName, this.SAMPLE_LIMIT);
+        var api = this._getSplunkApi(profile);
+        return this._processSampleSID(profile, sidResponse["sid"], api);
+    },
+
+    getSampleEventsSidByID: function(profile, notableIDs) {
+        gs.debug("Invoking getSampleEventsSidByID with inputs: {0} {1}", [this.JSONG.stringify(profile), notableIDs]);
+        var correlationRuleName = this._getCorrelationRuleNameFromProfileID(profile);
+        var testArr = [];
+        for (var j = 0; j < correlationRuleName.length; j++) {
+            escapedCorrelationRuleName = this._getEscapedCorrelationRuleName(correlationRuleName[j]);
+            testArr.push(
+                escapedCorrelationRuleName
+            );
+        }
+        var sidResponse = this._fetchSampleEventsByCorrelationRuleByID(profile, testArr, notableIDs);
+        var api = this._getSplunkApi(profile);
+        return this._processSampleSID(profile, sidResponse["sid"], api);
+    },
+
+    storeNewFiredNotableEvents: function(profiles, current) {
+        gs.debug("Invoking storeNewFiredNotableEvents with inputs: {0} {1}", [this.JSONG.stringify(profiles), current]);
+        //source and selectedApp remains same across all the profiles in batch
+        var source = profiles[0].profile.getValue('source');
+        var selectedApp = profiles[0].profile.getValue('selected_app');
+
+        for (var i = 0; i < profiles.length; i++) {
+            profiles[i]['escapedCorrelationRuleName'] = this._getEscapedCorrelationRuleName(profiles[i]['correlationRuleName']);
+            var gt_earliest_time = new GlideDateTime(profiles[i]['lastPulledDate']);
+
+            var isSingle = profiles[i]['profile'].getValue("one_time_retrieval") == '1';
+            if (!isSingle) {
+                gt_earliest_time.subtract(this.OVERLAP_TIME * 60 * 1000);
+            }
+
+            profiles[i]['earliest_time'] = gt_earliest_time;
+        }
+        var gt_latest_time = new GlideDateTime(current);
+        var latest_time = gt_latest_time.getNumericValue() / 1000;
+        var type = "New Notable";
+        var api = this._getSplunkApi(profiles[0]['profile']);
+        var sidResponse = this._getSIDForNewEvents(profiles, latest_time, api);
+        if (gs.nil(sidResponse)) {
+            return false;
+        }
+
+        var rule_profile_map = {};
+
+        for (i = 0; i < profiles.length; i++) {
+            var temp_json = {};
+            temp_json['profile_id'] = profiles[i].profile.getUniqueValue();
+            temp_json['is_aggregated'] = profiles[i].profile.getValue('use_coalesce') == true;
+            rule_profile_map[profiles[i]['correlationRuleName']] = temp_json;
+        }
+        this._queueForPollingWithContext(sidResponse, type, rule_profile_map, source, selectedApp);
+        return true;
+    },
+
+    storeUpdatedNotableEvents: function(profile, lastPulleddate, correlationRuleName, current) {
+        gs.debug("Invoking storeUpdatedNotableEvents with inputs: {0} {1} {2} {3}", [this.JSONG.stringify(profile), lastPulleddate, correlationRuleName, current]);
+        //var correlationRuleName = this._getCorrelationRuleNameFromProfile(profile);
+        var escapedCorrelationRuleName = this._getEscapedCorrelationRuleName(correlationRuleName);
+        var gt_earliest_time = new GlideDateTime(lastPulleddate);
+        var earliest_time = (gt_earliest_time.getNumericValue()) / 1000; // splunk epoch format
+        var gt_latest_time = new GlideDateTime(current);
+        var latest_time = gt_latest_time.getNumericValue() / 1000;
+        var type = "Updated Notable";
+        var api = this._getSplunkApi(profile);
+        var sidResponse = this._getSIDForUpdatedEvents(profile, escapedCorrelationRuleName, earliest_time, latest_time, api);
+        this._queueForPolling(profile, sidResponse, type, correlationRuleName);
+    },
+
+    getAllNotableStatus: function(profile) {
+        gs.debug("Invoking getAllNotableStatus with inputs: {0}", [this.JSONG.stringify(profile)]);
+        return this._getAllStatus(profile);
+    },
+    closeOutNotablesbyIDs: function(profile, notableIDs, closure_comments, closure_status, task_number, task_sys_id) {
+        gs.debug("Invoking closeOutNotablesbyIDs with inputs: {0} {1} {2} {3} {4} {5}", [this.JSONG.stringify(profile), notableIDs, closure_comments, closure_status, task_number, task_sys_id]);
+        var notables = this._formatNotableIDs(notableIDs);
+        var closure_comments = this._formatComment(closure_comments, task_number, task_sys_id);
+        return this._closeOutNotables(profile, notables, closure_comments, closure_status);
+    },
+    pollSID: function(profile, sid) {
+        gs.debug("Invoking pollSID with inputs: {0} {1}", [this.JSONG.stringify(profile), sid]);
+        var api = this._getSplunkApi(profile);
+        var selectedApp = profile.getValue('selected_app');
+        return this._pollSID(sid, api, selectedApp);
+    },
+    pullSampleEventsBySID: function(profile, sid) {
+        gs.debug("Invoking pullSampleEventsBySID with inputs: {0} {1}", [this.JSONG.stringify(profile), sid]);
+        var api = this._getSplunkApi(profile);
+        return this._getSampleEventsBySID(profile, sid, api);
+    },
+    // Private methods
+    // methods to fetch data from the API and carry out actions
+    _getLastError: function(profile) {
+        var api = this._getSplunkApi(profile);
+        return api.getLastError();
+    },
+
+    _processSampleSID: function(profile, sid, api) {
+        gs.debug("Invoking _processSampleSID with inputs: {0} {1} {2}", [this.JSONG.stringify(profile), sid, api]);
+        if (gs.nil(sid))
+            return null;
+        var resp = {
+            "type": ""
+        };
+        var selectedApp = profile.getValue('selected_app');
+        var sid_poll = this._pollSID(sid, api, selectedApp);
+        if (gs.nil(sid_poll))
+            return null;
+        if (sid_poll["dispatchState"] == "DONE") {
+            var events = this._getSampleEventsBySID(profile, sid, api);
+            if (events == null)
+                return null;
+            else {
+                resp["type"] = "events";
+                resp["events"] = events;
+            }
+        } else if (sid_poll["dispatchState"] == "FAILED") {
+            gs.error("Splunk ES: Sample SID failed for profile: " + profile.name + " , SID: " + sid);
+            return null;
+        } else {
+            resp["type"] = "sid";
+            resp["sid"] = sid;
+        }
+        return resp;
+    },
+
+    _getAllStatus: function(profile) {
+        gs.debug("Invoking _getAllStatus with inputs: {0}", [this.JSONG.stringify(profile)]);
+        var api = this._getSplunkApi(profile);
+        var s = api.getAllStatus();
+        if (gs.nil(s))
+            return {
+                "message": "error"
+            };
+        else
+            return {
+                "message": "success",
+                "body": s
+            };
+    },
+    _closeOutNotables: function(profile, notables, closure_comments, closure_status) {
+        gs.debug("Invoking _closeOutNotables with inputs: {0} {1} {2} {3}", [this.JSONG.stringify(profile), notables, closure_comments, closure_status]);
+        var api = this._getSplunkApi(profile);
+        var s = api.closeOutNotables(notables, closure_comments, closure_status);
+        try {
+            return JSON.parse(s);
+        } catch (e) {
+            gs.error("splunkes: ERROR while closing out notables: " + JSON.parse(notables) + ". Error: ", e);
+            return "";
+        }
+    },
+    _formatComment: function(comment, task_number, task_sys_id) {
+        gs.debug("Invoking _formatComment with inputs: {0} {1} {2}", [comment, task_number, task_sys_id]);
+        if (gs.nil(comment))
+            return "";
+        var captureGroup;
+        var replace = "";
+        var map = this._getSIColNamesFromLabels(comment);
+        var gr = new GlideRecord(this.TASK_TABLE);
+        gr.get(task_sys_id);
+        while ((captureGroup = this._TOKEN_REGEX.exec(comment)) !== null) {
+            try {
+                var key = captureGroup[1];
+                if (key == this._URL)
+                    replace = this._INSTANCE_URL + this._SECURITY_INCIDENT_LINK + task_sys_id;
+                else if (key in map)
+                    replace = gr.getDisplayValue(map[key]);
+                else
+                    replace = "";
+            } catch (e) {
+                gs.error("splunkes: error while formatting comment ", e);
+                replace = "";
+            }
+            comment = comment.replace('\${' + key + '}\$', replace);
+        }
+        return comment;
+    },
+    _getSIColNamesFromLabels: function(comment) {
+        gs.debug("Invoking _getSIColNamesFromLabels with inputs: {0}", [comment]);
+        var lables = [];
+        var map = {};
+        while ((captureGroup = this._TOKEN_REGEX.exec(comment)) !== null) {
+            var key = captureGroup[1];
+            lables.push(key);
+            comment = comment.replace('\${' + key + '}\$', '');
+        }
+        var tables = ['sn_si_incident', 'sm_order', 'task'];
+        var gr = new GlideRecord("sys_documentation"); // instead of sys_dictionary use this table for localization 
+        gr.addQuery("name", "IN", tables.join());
+        gr.addQuery("label", "IN", lables.join());
+        gr.query();
+        while (gr.next())
+            map[gr.label] = gr.element + "";
+        return map;
+    },
+    _getClosedBy: function(task_sys_id) {
+        gs.debug("Invoking _getClosedBy with inputs: {0}", [task_sys_id]);
+        var gr = new GlideRecord(this.TASK_TABLE);
+        if (gr.get(task_sys_id)) {
+            var closedBy = gr.getValue('closed_by');
+            if (!gs.nil(closedBy)) {
+                var userGR = new GlideRecord('sys_user');
+                if (userGR.get(closedBy)) {
+                    return userGR.getValue('name');
+                }
+            }
+        }
+        return '';
+    },
+    _getClosureNotes: function(task_sys_id) {
+        gs.debug("Invoking _getClosureNotes with inputs: {0}", [task_sys_id]);
+        var gr = new GlideRecord(this.TASK_TABLE);
+        gr.get(task_sys_id);
+        return gr.getValue('close_notes');
+    },
+    _formatNotableIDs: function(ids) {
+        gs.debug("Invoking _formatNotableIDs with inputs: {0}", [ids]);
+        var formattedNotables = "";
+        var len = ids.length;
+        if (len > 0) {
+            formattedNotables += gs.urlEncode(ids[0]);
+            for (i = 1; i < len; i++)
+                formattedNotables += "&ruleUIDs=" + gs.urlEncode(ids[i]);
+        }
+        return formattedNotables;
+    },
+    _refreshCorrelationRules: function(profile, selectedApp) {
+        gs.debug("Invoking _refreshCorrelationRules with inputs: {0}", [this.JSONG.stringify(profile)]);
+        var api = this._getSplunkApi(profile);
+        var body = api.getCorrelationRules(this._SPLUNK_ALERT_LIMIT, selectedApp);
+        if (body) {
+            var CorrelationRules = this._parseTitles(body);
+            var ids = this._insertCorrelationRules(profile, CorrelationRules);
+            var currentAlert = this._getCurrentCorrelationRule(profile);
+            return {
+                message: "success",
+                CorrelationRules: JSON.stringify(ids),
+                currentCorrelationRule: JSON.stringify(currentAlert),
+            };
+        } else {
+            return {
+                message: "failure",
+            };
+        }
+    },
+    _fetchSampleEventsByCorrelationRule: function(profile, correlationRuleName, limit) {
+        gs.debug("Invoking _fetchSampleEventsByCorrelationRule with inputs: {0} {1} {2}", [this.JSONG.stringify(profile), correlationRuleName, limit]);
+        var api = this._getSplunkApi(profile);
+        var splunk_search = 'search (source="' + correlationRuleName + '") `notable_by_id("*")` | search NOT `suppression` | head ' + limit + ' | fields *';
+        var gdt = new GlideDateTime();
+        gdt.addDaysUTC(this.LATEST_ENTRY_LIMIT_DAYS);
+        var epochTimeStamp = parseInt(gdt.getNumericValue(), 10);
+        var earliest_time = epochTimeStamp / 1000;
+        var latest_time = 'now';
+        var selectedApp = profile.getValue('selected_app');
+        return this._fireSearchAndGetSID(api, splunk_search, earliest_time, latest_time, selectedApp);
+    },
+
+    _fetchSampleEventsByCorrelationRuleByID: function(profile, correlationRuleName, notableIDs) {
+        gs.debug("Invoking _fetchSampleEventsByCorrelationRuleByID with inputs: {0} {1} {2}", [this.JSONG.stringify(profile), correlationRuleName, notableIDs]);
+        var api = this._getSplunkApi(profile);
+        var splunk_search = 'search ' + this.correlationRuleNames(correlationRuleName) + ' `notable_by_id("*")` | search event_id IN (' + notableIDs + ')' + ' | fields *';
+        // Converting time to epoch timestamp
+        var gdt = new GlideDateTime();
+        gdt.addDaysUTC(this.LATEST_ENTRY_LIMIT_DAYS);
+        var epochTimeStamp = parseInt(gdt.getNumericValue(), 10);
+        var earliest_time = epochTimeStamp / 1000;
+        var latest_time = 'now';
+        var selectedApp = profile.getValue('selected_app');
+        return this._fireSearchAndGetSID(api, splunk_search, earliest_time, latest_time, selectedApp);
+    },
+
+    correlationRuleNames: function(arr) {
+        gs.debug("Invoking correlationRuleNames with inputs: {0}", [arr]);
+        var searchQu = '';
+        for (var i = 0; i < arr.length; i++) {
+            searchQu += '(source="' + arr[i] + '")';
+            if (i != arr.length - 1) {
+                searchQu += ' OR ';
+            }
+        }
+        return searchQu;
+    },
+
+    _getSIDForNewEvents: function(profiles, latest_time, api) {
+        gs.debug("Invoking _getSIDForNewEvents with inputs: {0} {1} {2}", [this.JSONG.stringify(profiles), latest_time, api]);
+        var splunk_search = "search ";
+        var earliest_time = profiles[0]['earliest_time'];
+        for (var i = 0; i < profiles.length; i++) {
+            var ruleName = profiles[i]['escapedCorrelationRuleName'];
+            var et = (profiles[i]['earliest_time'].getNumericValue()) / 1000;
+            splunk_search += '(source="' + ruleName + '" _time>=' + et + ')';
+            if (profiles[i]['earliest_time'] < earliest_time) {
+                earliest_time = profiles[i]['earliest_time'];
+            }
+            if (i != profiles.length - 1) {
+                splunk_search += ' OR ';
+            }
+        }
+        splunk_search += ' `notable_by_id("*")` | search NOT `suppression` | fields *';
+        earliest_time = (earliest_time.getNumericValue()) / 1000; // splunk epoch format
+        return this._fireSearchAndGetSID(api, splunk_search, earliest_time, latest_time, profiles[0]['selected_app']);
+    },
+
+    _getSIDForUpdatedEvents: function(profile, correlationRuleName, earliest_time, latest_time, api) {
+        gs.debug("Invoking _getSIDForUpdatedEvents with inputs: {0} {1} {2} {3} {4}", [this.JSONG.stringify(profile), correlationRuleName, earliest_time, latest_time, api]);
+        var rule_name = this._getEscapedCorrelationRuleName(correlationRuleName);
+        var regex = /^(?:[^-]* - )?(.*) - Rule$/;
+        rule_name = rule_name.replace(regex, '$1');
+        if (rule_name) {
+            rule_name = rule_name.trim();
+        }
+        var splunk_search = '| inputlookup append=T incident_review_lookup  where time >= ' + earliest_time + ' AND time <= ' + latest_time + ' AND rule_name="' + rule_name + '"' +
+            '| eventstats max(time) as last_modified_time by rule_id | where (time == last_modified_time)' +
+            '| rename user as reviewer' +
+            '| lookup update=true user_realnames_lookup user as "owner" OUTPUTNEW realname as "owner_realname"' +
+            '| eval owner_realname=if(isnull(owner_realname),owner,owner_realname), last_modified_time=strftime(last_modified_time,"%Y-%m-%d %H:%M:%S")' +
+            '| lookup update=true user_realnames_lookup user as "reviewer" OUTPUTNEW realname as "reviewer_realname"' +
+            '| eval reviewer_realname=if(isnull(reviewer_realname),reviewer,reviewer_realname), nullstatus=if(isnull(status),"true","false"), temp_status=if(isnull(status),-1,status)' +
+            '| lookup update=true reviewstatuses_lookup _key as temp_status OUTPUT status,label as status_label,description as status_description,default as status_default,end as status_end' +
+            '| eval status=if(isnull(status_label),0,status), status_label=if(isnull(status_label),"Unassigned",status_label), status_description=if(isnull(status_description),"unknown",status_description), status_default=case(match(status_default,"1|[Tt]|[Tt][Rr][Uu][Ee]"),"true",match(status_default,"0|[Ff]|[Ff][Aa][Ll][Ss][Ee]"),"false",true(),status_default), status_end=case(match(status_end,"1|[Tt]|[Tt][Rr][Uu][Ee]"),"true",match(status_end,"0|[Ff]|[Ff][Aa][Ll][Ss][Ee]"),"false",true(),status_end), status_group=case((status_default == "true"),"New",(status_end == "true"),"Closed",(status == 0),"New",true(),"Open") ' +
+            '| eval status=if(((isnull(status) OR isnull(status_label)) AND (nullstatus == "false")),0,status), status_label=if((isnull(status_label) AND (nullstatus == "false")),"Unassigned",status_label), status_description=if((isnull(status_description) AND (nullstatus == "false")),"unknown",status_description)';
+
+        if (profile.use_creation_status && !gs.nil(profile.intial_status))
+            splunk_search += '| where status !=' + profile.intial_status;
+        if (profile.use_closure_status && !gs.nil(profile.closure_status))
+            splunk_search += '| where status !=' + profile.closure_status;
+        splunk_search += ' | fields * | fields - temp_status, nullstatus,time';
+
+        var selectedApp = profile.getValue('selected_app');
+
+        return this._fireSearchAndGetSID(api, splunk_search, earliest_time, latest_time, selectedApp);
+    },
+    // There is one pending
+    _fireSearchAndGetSID: function(api, splunk_search, earliest_time, latest_time, selectedApp) {
+        gs.debug("Invoking _fireSearchAndGetSID with inputs: {0} {1} {2} {3}", [api, splunk_search, earliest_time, latest_time]);
+        var resp = api.getSID(splunk_search, earliest_time, latest_time, this._SID_TTL, selectedApp);
+        if (gs.nil(resp))
+            return null;
+        try {
+            var obj = JSON.parse(resp);
+            return {
+                "sid": obj["sid"],
+                "splunk_search": splunk_search,
+                "earliest_time": earliest_time,
+                "latest_time": latest_time
+            };
+        } catch (e) {
+            gs.error("splunkes: error while getting sid, profile: " + profile.name + " earliest: " + earliest_time + " latest: " + latest_time, e);
+            return null;
+        }
+    },
+    _getSampleEventsBySID: function(profile, sid, api) {
+        gs.debug("Invoking _getSampleEventsBySID with inputs: {0} {1} {2}", [this.JSONG.stringify(profile), sid, api]);
+        var offset = 0;
+        var selectedApp = profile.getValue('selected_app');
+        var raw = api.getEventsBySID(sid, this._COUNT, offset, selectedApp);
+        if (!gs.nil(raw)) {
+            var events = this._parseEventsRaw(raw);
+            this._queueImport(profile, events);
+            return events;
+        } else {
+            gs.error("splunkes: Error while fetching new events with SID");
+            return null;
+        }
+    },
+    _fetchNewEventsBySID: function(sid, eventCount, api, type, selectedApp) {
+        gs.debug("Invoking _fetchNewEventsBySID with inputs: {0} {1} {2} {3}", [sid, eventCount, api, type]);
+        var offset = 0;
+        var cache = {};
+        var rData = new SplunkESRawData();
+        //pagination
+        while (offset < eventCount) {
+            var raw = api.getEventsBySID(sid, this._COUNT, offset, selectedApp);
+            if (!gs.nil(raw)) {
+                rData.storeRawData(sid, raw, type);
+            } else
+                gs.error("splunkes: Error while fetching new events with SID");
+            offset += this._COUNT;
+        }
+    },
+
+    fetchNewEventsBySIDJSON: function(sid, eventCount, api, type, selectedApp, contextMap) {
+        gs.debug("Invoking fetchNewEventsBySIDJSON with inputs: {0} {1} {2} {3} {4}", [sid, eventCount, api, type, contextMap]);
+        var offset = 0;
+        var cache = {};
+        var rData = new SplunkESRawData();
+        //pagination
+        while (offset < eventCount) {
+            var raw = api.getEventsBySIDJSON(sid, this._COUNT, offset, selectedApp);
+            if (!gs.nil(raw)) {
+                rData.storeRawDataJSON(sid, raw, type, contextMap);
+            } else
+                gs.error("splunkes: Error while fetching new events with SID");
+            offset += this._COUNT;
+        }
+    },
+
+    _fetchUpdatedEventsBySID: function(profile, sid, eventCount, api, type) {
+        gs.debug("Invoking _fetchUpdatedEventsBySID with inputs: {0} {1} {2} {3} {4}", [this.JSONG.stringify(profile), sid, eventCount, api, type]);
+        var offset = 0;
+        var rData = new SplunkESRawData();
+        //pagination
+        var selectedApp = profile.getValue('selected_app');
+        while (offset < eventCount) {
+            var raw = api.getEventsBySID(sid, this._COUNT, offset, selectedApp);
+            if (!gs.nil(raw)) {
+                rData.storeRawData(sid, raw, type, profile.getUniqueValue());
+            } else
+                gs.error("splunkes: Error while fetching updated events with SID");
+            offset += this._COUNT;
+        }
+
+    },
+
+    _fetchUpdatedEventsBySIDJSON: function(profile, sid, eventCount, api, type) {
+        gs.debug("Invoking _fetchUpdatedEventsBySID with inputs: {0} {1} {2} {3} {4}", [this.JSONG.stringify(profile), sid, eventCount, api, type]);
+        var offset = 0;
+        var rData = new SplunkESRawData();
+        //pagination
+        var selectedApp = profile.getValue('selected_app');
+        while (offset < eventCount) {
+            var raw = api.getEventsBySIDJSON(sid, this._COUNT, offset, selectedApp);
+            if (!gs.nil(raw)) {
+                rData.storeRawDataJSONForUpdatedNotables(sid, raw, type, profile.getUniqueValue());
+            } else
+                gs.error("splunkes: Error while fetching updated events with SID");
+            offset += this._COUNT;
+        }
+
+    },
+    _pollSID: function(sid, api, selectedApp) {
+        gs.debug("Invoking _pollSID with inputs: {0} {1}", [sid, api, selectedApp]);
+        var resp = api.pollSID(sid, selectedApp);
+        if (gs.nil(resp))
+            return null;
+        var result = {};
+        try {
+            var obj = JSON.parse(resp);
+
+            result["dispatchState"] = obj["entry"][0]["content"]["dispatchState"];
+            result["eventCount"] = obj["entry"][0]["content"]["resultCount"];
+            result["runDuration"] = obj["entry"][0]["content"]["runDuration"];
+
+            return result;
+        } catch (e) {
+            gs.error("splunkes: error while polling sid: " + sid, e);
+            return null;
+        }
+    },
+    _queueForPolling: function(profile, sidResponse, type, ruleName) {
+        gs.debug("Invoking _queueForPolling with inputs: {0} {1} {2} {3} {4} {5}", [this.JSONG.stringify(profile), this.JSONG.stringify(sidResponse), type, ruleName]);
+        var gr = new GlideRecord(this.SID_POLLING_TABLE);
+        gr.setValue("type", type);
+        gr.setValue("profile", profile.getUniqueValue());
+        gr.setValue("correlation_rule_name", ruleName);
+        if (type == "New Notable") {
+            gr.setValue("splunk_search", sidResponse["splunk_search"]);
+        } else if (type == "Updated Notable") {
+            gr.setValue("profile", profile.getUniqueValue());
+            gr.setValue("correlation_rule_name", ruleName);
+        }
+        gr.setValue("source", profile.getValue('source'));
+        gr.setValue("selected_app", profile.getValue('selected_app'));
+        gr.setValue("sid", sidResponse["sid"]);
+        gr.setValue("job_state", "Waiting");
+        gr.setValue("earliest_time", sidResponse["earliest_time"]);
+        gr.setValue("latest_time", sidResponse["latest_time"]);
+        gr.insert();
+    },
+
+    _queueForPollingWithContext: function(sidResponse, type, contextMap, source, selectedApp) {
+        gs.debug("Invoking _queueForPollingWithContext with inputs: {0} {1} {2}", [this.JSONG.stringify(sidResponse), type, this.JSONG.stringify(contextMap)]);
+        var gr = new GlideRecord(this.SID_POLLING_TABLE);
+        gr.setValue("type", type);
+        gr.setValue("splunk_search", sidResponse["splunk_search"]);
+        gr.setValue("rule_profile_map", this.JSONG.stringify(contextMap));
+        gr.setValue("source", source);
+        gr.setValue("selected_app", selectedApp);
+        gr.setValue("sid", sidResponse["sid"]);
+        gr.setValue("job_state", "Waiting");
+        gr.setValue("earliest_time", sidResponse["earliest_time"]);
+        gr.setValue("latest_time", sidResponse["latest_time"]);
+        gr.insert();
+    },
+
+    _storeNewEvents: function(sid, events, type, cache) {
+        gs.debug("Invoking _storeNewEvents with inputs: {0} {1}", [sid, type]);
+        var self = this;
+        events.forEach(function(obj) {
+            var event_id = obj.event_id.value;
+            var ruleName = obj.source.value;
+            var ref_id = ruleName + "_" + sid;
+            var profile = null;
+            if (ref_id in cache) {
+                profile = cache[ref_id];
+            } else {
+                var gr = new GlideRecord(self.SID_POLLING_TABLE);
+                gr.addQuery("sid", sid);
+                gr.addQuery("correlation_rule_name", ruleName);
+                gr.setLimit(1);
+                gr.query();
+                if (gr.next()) {
+                    profile = new GlideRecord(self.SPLUNKES_PROFILE_TABLE);
+                    profile.get(gr.getValue('profile'));
+                    cache[ref_id] = profile;
+                }
+            }
+            if (!self._checkIfTaskExists(event_id) && !gs.nil(profile)) {
+                self._storeEventInImportTable(profile, event_id, obj, type); //store in import table
+            }
+        });
+    },
+
+    _storeNewEvent: function(sid, event, type, profileId) {
+        gs.debug("Invoking _storeNewEvent with inputs: {0} {1} {2} {3}", [sid, JSON.stringify(event), type, profileId]);
+        var self = this;
+        var event_id = event.event_id.value;
+        var ruleName = event.source.value;
+        var ref_id = ruleName + "_" + sid;
+        if (!self._checkIfTaskExists(event_id) && !gs.nil(profileId)) {
+            self._storeEventInImportTableByProfileId(profileId, event_id, event, type); //store in import table
+        }
+    },
+
+    _storeUpdatedEvents: function(profile, events, type) {
+        gs.debug("Invoking _storeUpdatedEvents with inputs: {0} {1}", [this.JSONG.stringify(profile), type]);
+        var self = this;
+        var eventsArray = Array.isArray(events) ? events : [events];
+        eventsArray.forEach(function(obj) {
+            var event_id = obj.rule_id.value;
+            var gr = self._checkIfNotableExists(event_id);
+
+            if (!gs.nil(gr) && !self._checkIfTaskExists(gr.notable_event_id)) {
+                var previousEvent = JSON.parse(gr.notable_event_raw);
+                var currentEvent = previousEvent;
+                var flag = false;
+                for (var key in obj) {
+
+                    if (!gs.nil(obj[key].value)) {
+                        if (key in previousEvent) {
+                            currentEvent[key].value = obj[key].value;
+                            flag = true;
+                        } else {
+                            currentEvent[key] = {
+                                "value": ""
+                            };
+                            currentEvent[key].value = obj[key].value;
+                            flag = true;
+                        }
+
+                        if (obj[key].isTruncated)
+                            currentEvent[key].isTruncated = obj[key].isTruncated;
+                    }
+                }
+
+                if (flag)
+                    self._storeEventInImportTable(profile, event_id, currentEvent, type); //store in import table
+            }
+        });
+    },
+	
+    _storeEventInImportTable: function(profile, event_id, event, type) {
+        gs.debug("Invoking _storeEventInImportTable with inputs: {0} {1} {2}", [this.JSONG.stringify(profile), event_id, type]);
+        try {
+            var gr = new GlideRecord(this.EVENT_IMPORT_TABLE);
+            gr.setValue("profile", profile.getUniqueValue());
+            gr.setValue("notable_event_id", event_id);
+            gr.setValue('notable_event_raw', JSON.stringify(event));
+            gr.setValue("notable_type", type);
+            var fieldMap = this._getFieldMapping();
+            for (var key in event) {
+                if (key in fieldMap)
+                    gr.setValue(fieldMap[key], event[key].value);
+            }
+            return gr.insert();
+        } catch (ex) {
+            gs.error("Error in stroing event in the import table: ", ex);
+        }
+    },
+
+    _storeEventInImportTableByProfileId: function(profileId, event_id, event, type) {
+        gs.debug("Invoking _storeEventInImportTable with inputs: {0} {1} {2}", [profileId, event_id, type]);
+        try {
+            var gr = new GlideRecord(this.EVENT_IMPORT_TABLE);
+            gr.setValue("profile", profileId);
+            gr.setValue("notable_event_id", event_id);
+            gr.setValue('notable_event_raw', JSON.stringify(event));
+            gr.setValue("notable_type", type);
+            var fieldMap = this._getFieldMapping();
+            for (var key in event) {
+                if (key in fieldMap)
+                    gr.setValue(fieldMap[key], event[key].value);
+            }
+            return gr.insert();
+        } catch (ex) {
+            gs.error("Error in stroing event in the import table: ", ex);
+        }
+    },
+
+    _checkIfTaskExists: function(notable_id) {
+        gs.debug("Invoking _checkIfTaskExists with inputs: {0}", [notable_id]);
+        var gr = new GlideRecord(this.EVENT_TO_TASK_TABLE);
+        gr.addQuery("notable_event_id", notable_id);
+        gr.setLimit(1);
+        gr.query();
+        if (gr.next())
+            return true;
+        else
+            return false;
+    },
+
+    _checkIfNotableExists: function(event_id) {
+        gs.debug("Invoking _checkIfNotableExists with inputs: {0}", [event_id]);
+        var gr = new GlideRecord(this.EVENT_IMPORT_TABLE);
+        gr.addQuery("notable_event_id", event_id);
+        gr.setLimit(1);
+        gr.query();
+        if (gr.next())
+            return gr;
+        else
+            return null;
+    },
+    _queueImport: function(profile, events, callback) {
+        gs.debug("Invoking _queueImport with inputs: {0}", [this.JSONG.stringify(profile)]);
+        var csv = this._fieldsAsCSV(profile, events);
+        if (csv) {
+            profile.setValue('has_pending_import', true);
+            profile.update();
+            new SplunkESFieldImportQueue().queueImport(profile.getUniqueValue(), csv, callback);
+            return true;
+        }
+        return false;
+    },
+    _getFieldMapping: function() {
+        gs.debug("Invoking _getFieldMapping");
+        var query = new GlideRecord('sys_dictionary');
+        query.addQuery('name', this.EVENT_IMPORT_TABLE);
+        query.addQuery('element', 'STARTSWITH', 'u_');
+        query.query();
+        var map = {};
+        while (query.next())
+            map[query.getValue('column_label')] = query.getValue('element');
+
+        var collisions = new GlideRecord('sn_sec_splunkes_field_collision_mapping');
+        collisions.query();
+        while (collisions.next())
+            map[collisions.getValue('splunk_field')] = map[collisions.getValue('sn_column_label')];
+
+        return map;
+    },
+    _getFields: function(events) {
+        gs.debug("Invoking _getFields");
+        var keys = {};
+        events.forEach(function(event) {
+            try {
+
+                for (var key in event) {
+                    if (!keys[key])
+                        keys[key] = event[key].value;
+                }
+            } catch (e) {
+                gs.error("Error in invoking _getFields: ", e);
+            }
+        });
+        return keys;
+    },
+    _fieldsAsCSV: function(profile, events) {
+        gs.debug("Invoking _fieldsAsCSV with inputs: {0}", [this.JSONG.stringify(profile)]);
+        var csvHeaders = '';
+        var csvFirstRow = '';
+
+        var hasItems = false;
+        var fieldList = new XMLDocument2();
+        var rootElement = fieldList.createElement("fields");
+        var keys = this._getFields(events);
+        var columnFieldMap = this._sanitizeFieldNames(keys);
+        for (var key in keys) {
+            var columnName = columnFieldMap[key].replace(/"/g, '""'); //csv escaping quotes
+            var columnValue = keys[key].replace(/"/g, '""');
+            csvHeaders += csvHeaders.length ? ',' + '"' + columnName + '"' : '"' + columnName + '"';
+            csvFirstRow += csvFirstRow.length ? ',' + '"' + columnValue + '"' : '"' + columnValue + '"';
+            fieldList.setCurrentElement(rootElement);
+            fieldList.createElementWithTextValue("k", key);
+            hasItems = true;
+        };
+        if (hasItems) {
+            profile.setValue('splunk_keys', fieldList.toString());
+            profile.update();
+            return csvHeaders + '\n' + csvFirstRow;
+        }
+        return null;
+    },
+    _sanitizeFieldNames: function(fields) {
+        gs.debug("Invoking _sanitizeFieldNames with inputs: {0}", [fields]);
+        var countMap = {};
+        var result = {};
+        var query = new GlideRecord('sys_dictionary');
+        query.addQuery('name', this.EVENT_IMPORT_TABLE);
+        query.addQuery('element', 'STARTSWITH', 'u_');
+        query.query();
+        while (query.next()) {
+            var columnLabel = query.getValue('column_label');
+            var cleanName = columnLabel.toLowerCase().replace(/[^0-9a-z]/gi, '_');
+            result[columnLabel] = columnLabel;
+            countMap[cleanName] = 0;
+        }
+        var collisions = new GlideRecord(this.COLLISION_MAPPING_TABLE);
+        collisions.query();
+        while (collisions.next()) {
+            result[collisions.getValue('splunk_field')] = collisions.getValue('sn_column_label');
+            var snColCleanName = collisions.getValue('splunk_field').toLowerCase().replace(/[^0-9a-z]/gi, '_');
+            if (snColCleanName in countMap) {
+                countMap[snColCleanName]++;
+            } else {
+                countMap[snColCleanName] = 1;
+            }
+        }
+        for (var splunkField in fields) {
+            if (!(splunkField in result)) {
+                var fieldCleanName = splunkField.toLowerCase().replace(/[^0-9a-z]/gi, '_');
+                if (fieldCleanName in countMap) {
+                    countMap[fieldCleanName]++;
+                    var newColumnName = splunkField + "(" + countMap[fieldCleanName] + ")";
+                    result[splunkField] = newColumnName;
+                    var gr = new GlideRecord(this.COLLISION_MAPPING_TABLE);
+                    gr.initialize();
+                    gr.setValue("splunk_field", splunkField);
+                    gr.setValue("sn_column_label", newColumnName);
+                    gr.insert();
+                } else {
+                    countMap[fieldCleanName] = 0;
+                    result[splunkField] = splunkField;
+                }
+            }
+        }
+        return result;
+    },
+
+    /////////////////
+    _parseEventsRawJSON: function(rawJSON, sid) {
+        gs.debug("Invoking _parseEventsRaw with inputs: {0}", [sid]);
+        var ret = [];
+        var self = this;
+        try {
+            var parsed = JSON.parse(rawJSON);
+            ret.push(self._parseFieldsJSON(parsed, sid));
+
+        } catch (ex) {
+            gs.error("Error parsing Splunk JSON response: {0}", ex);
+        }
+
+        var substitutedValues = this._substituteSplunkFields(ret);
+        return substitutedValues;
+    },
+
+    /////////////////
+    _parseEventsRaw: function(raw, sid) {
+        gs.debug("Invoking _parseEventsRaw with inputs: {0}", [sid]);
+        var iteratorBuilder = this.nodeIterator;
+        var resultXML = new XMLDocument2();
+        resultXML.parseXML(raw);
+        var resultIter = iteratorBuilder(resultXML, "/results/result");
+        var ret = [];
+        var self = this;
+        resultIter.each(function(node) {
+            ret.push(self._parseFields(node, sid));
+        });
+        var substitutedValues = this._substituteSplunkFields(ret);
+        return substitutedValues;
+    },
+    _substituteSplunkFields: function(splunkData) {
+        gs.debug("Invoking _substituteSplunkFields");
+        var newSplunkData = [];
+        for (var key in splunkData) {
+            newSplunkData.push(this._getParsedSplunkValues(splunkData[key]));
+        }
+        return newSplunkData;
+    },
+    _getParsedSplunkValues: function(splunkKeyValuePair) {
+        gs.debug("Invoking _getParsedSplunkValues with inputs: {0}", [this.JSONG.stringify(splunkKeyValuePair)]);
+        var newObj = {};
+        for (var key in splunkKeyValuePair) {
+            newObj[key] = {
+                "value": this._buildInputValue(splunkKeyValuePair, splunkKeyValuePair[key].value)
+            };
+            if (splunkKeyValuePair[key].isTruncated)
+                newObj[key].isTruncated = true;
+        }
+        return newObj;
+    },
+
+    _buildInputValue: function(splunkFields, inputExpression) {
+        gs.debug("Invoking _buildInputValue with inputs: {0} {1}", [splunkFields, inputExpression]);
+        if (!inputExpression)
+            return "";
+        var matches = inputExpression.match(this.SPLUNK_REGEX);
+        var sourceFieldName, fullMatch, replace;
+        if (matches && matches.length > 0) {
+            for (var i = 0; i < matches.length; i++) {
+                fullMatch = matches[i];
+                sourceFieldName = fullMatch.replace(/\$/g, '');
+                if (splunkFields.hasOwnProperty(sourceFieldName)) {
+                    replace = splunkFields[sourceFieldName].value;
+                }
+                if (!replace) {
+                    inputExpression = this.replacePattern(inputExpression, '$' + sourceFieldName + '$', '__' + sourceFieldName + '__');
+                } else {
+                    inputExpression = this.replacePattern(inputExpression, '$' + sourceFieldName + '$', replace);
+                }
+            }
+        }
+        var replaceSplunkRegex = /__(.*?)__/g;
+        matches = inputExpression.match(replaceSplunkRegex);
+        if (matches && matches.length > 0) {
+            for (var j = 0; j < matches.length; j++) {
+                fullMatch = matches[j];
+                sourceFieldName = fullMatch.replace(/\$/g, '');
+                inputExpression = this.replacePattern(inputExpression, '__' + sourceFieldName + '__', '$' + sourceFieldName + '$');
+            }
+        }
+        return inputExpression;
+    },
+
+    replacePattern: function(mainString, pattern, value) {
+        gs.debug("Invoking replacePattern with inputs: {0} {1} {2}", [mainString, pattern, value]);
+        var patternStartIdx = mainString.indexOf(pattern);
+        if (patternStartIdx == -1) {
+            return mainString;
+        }
+        var patternEndIdx = patternStartIdx + pattern.length;
+        var replacedValue = mainString.substr(0, patternStartIdx) + value + mainString.substr(patternEndIdx);
+        return replacedValue;
+    },
+
+    _parseFieldsJSON: function(result, sid) {
+        gs.debug("Invoking _parseFieldsJSON with inputs: {0} {1}", [this.JSONG.stringify(result), sid]);
+        var valuesLimit = this._SPLUNK_FIELD_VALUES_LIMIT;
+        var obj = {};
+        var self = this;
+
+        try {
+            for (var key in result) {
+                if (!result.hasOwnProperty(key))
+                    continue;
+
+                var value = result[key];
+                var isTruncated = false;
+                var valueArray = [];
+
+                // Normalize everything to an array of strings
+                if (Array.isArray(value)) {
+                    valueArray = value.map(function(val) {
+                        return val.toString().trim();
+                    });
+                } else if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+                    valueArray = [value.toString().trim()];
+                }
+
+                // Enforce value limit
+                if (valueArray.length > valuesLimit) {
+                    valueArray = valueArray.slice(0, valuesLimit);
+                    isTruncated = true;
+                }
+
+                var cnctValue = valueArray
+                    .filter(function(val) {
+                        return val !== "";
+                    })
+                    .join(self._DEL);
+
+                key = self._replaceSpecialQuotes(key);
+                cnctValue = self._replaceSpecialQuotes(cnctValue);
+
+                obj[key] = {
+                    value: cnctValue
+                };
+
+                if (isTruncated) {
+                    obj[key].isTruncated = true;
+                }
+            }
+        } catch (ex) {
+            gs.error("Splunk ES error in parsing fields: ", ex);
+        }
+
+        return obj;
+    },
+
+    _parseFields: function(node, sid) {
+        gs.debug("Invoking _parseFields with inputs: {0} {1}", [node, sid]);
+        var valuesLimit = this._SPLUNK_FIELD_VALUES_LIMIT;
+        var valueCount;
+
+        var iteratorBuilder = this.nodeIterator;
+        var self = this;
+        var eventXML = new XMLDocument2();
+        var rawNode = node.toString();
+        eventXML.parseXML(rawNode);
+        var obj = {};
+        var eventIter = iteratorBuilder(eventXML, "//field");
+        var self = this;
+        try {
+            eventIter.each(function(node) {
+                valueCount = 0;
+                var key = node.getAttribute("k");
+
+                var values = [];
+                var rulesXML = new XMLDocument2();
+                rulesXML.parseXML(node);
+                var tempNode = rulesXML.getFirstNode("//field/value/text");
+                var isTruncated = false;
+                if (!gs.nil(tempNode)) {
+                    values.push(tempNode.getTextContent());
+                    valueCount++;
+
+                    while (tempNode) {
+                        tempNode = rulesXML.getNextNode(tempNode);
+                        if (!tempNode)
+                            break;
+                        if (valueCount >= valuesLimit) {
+                            isTruncated = true;
+                            break;
+                        }
+                        values.push(tempNode.getTextContent());
+                        valueCount++;
+                    }
+                }
+                var cnctValue = "";
+
+                if (values.length != 0) {
+                    values.forEach(function(valueTemp) {
+                        valueTemp = valueTemp.trim();
+                        if (!(valueTemp === "")) {
+                            cnctValue += valueTemp;
+                            cnctValue += self._DEL;
+                        }
+                    });
+                    cnctValue = cnctValue.substr(0, cnctValue.length - self._DEL.length);
+                } else {
+                    tempNode = rulesXML.getFirstNode("//field/v");
+                    var tempValue = tempNode.getTextContent();
+                    if (!gs.nil(tempValue)) {
+                        cnctValue += tempValue;
+                    }
+                }
+                key = self._replaceSpecialQuotes(key);
+                cnctValue = self._replaceSpecialQuotes(cnctValue);
+                obj[key] = {
+                    value: cnctValue
+                };
+
+                if (isTruncated)
+                    obj[key].isTruncated = true;
+            });
+        } catch (ex) {
+            gs.error("Splunk ES error in parsing fields: ", ex);
+        }
+        return obj;
+    },
+
+    _replaceSpecialQuotes: function(val) {
+        gs.debug("Invoking _replaceSpecialQuotes with inputs: {0}", [val]);
+        var str = val;
+        for (var i = 0; i < str.length; i++) {
+            if (str.charCodeAt(i) === 8216 || str.charCodeAt(i) === 8217) {
+                //8216, 8217 is ascii values of "(special quotes characters)
+                // replacing special " with normal " as glide does not support some special characters.
+                str = str.substr(0, i) + "'" + str.substr(i + 1);
+            } else if (str.charCodeAt(i) === 8220 || str.charCodeAt(i) === 8221) {
+                //8220 and 8221 and is ascii values of '(special quotes characters)
+                // replacing special ' with normal ' as glide does not support some special characters.
+                str = str.substr(0, i) + '"' + str.substr(i + 1);
+            }
+        }
+        return str;
+    },
+
+    /////////////////////
+    _parseTitles: function(body) {
+        gs.debug("Invoking _parseTitles with inputs: {0}", [this.JSONG.stringify(body)]);
+        var titles = [];
+        var regexForDoubleQuotes = /"/g;
+        var content = JSON.parse(body);
+        var entries = content.entry;
+        for (var i = 0; i < entries.length; i++) {
+            var ruleName = entries[i].name;
+            titles.push(ruleName.replace(regexForDoubleQuotes, '_'));
+        }
+        return titles;
+    },
+    // util methods
+    nodeIterator: function(xml, path) {
+        this.each = function(fn) {
+            var _node = xml.getFirstNode(path);
+            if (!_node)
+                return;
+            fn(_node);
+            while (_node) {
+                _node = xml.getNextNode(_node);
+                if (!_node)
+                    break;
+                fn(_node);
+            }
+        };
+        return this;
+    },
+    _getSplunkApi: function(profile) {
+        if (!profile)
+            throw "No profile given";
+        return this.getApiFactory().build(new SplunkESEventIngestionConfiguration(profile.source).getConfig());
+    },
+
+    _getSplunkAPIBySource: function(sourceId) {
+        if (!sourceId)
+            throw "No source given";
+        return this.getApiFactory().build(new SplunkESEventIngestionConfiguration(sourceId).getConfig());
+    },
+
+    _getCorrelationRuleNameFromProfile: function(profile) {
+        gs.debug("Invoking _getCorrelationRuleNameFromProfile with inputs: {0}", [this.JSONG.stringify(profile)]);
+        var ruleId = profile.correlation_rules_list;
+        var rule = new GlideRecord(this.CORRELATION_RULES_TABLE);
+        if (rule.get(ruleId))
+            return rule.getValue('correlation_rule_name');
+        else
+            return "";
+    },
+
+    _getCorrelationRuleNameFromProfileID: function(profile) {
+        gs.debug("Invoking _getCorrelationRuleNameFromProfileID with inputs: {0}", [this.JSONG.stringify(profile)]);
+        var ruleId = profile.correlation_rules_list;
+        var selected_rulesES = [];
+        var ruleArr = ruleId.split(",");
+        var rulesGr = new GlideRecord(this.CORRELATION_RULES_TABLE);
+        rulesGr.addQuery('sys_id', 'IN', ruleArr);
+        rulesGr.query();
+        while (rulesGr.next()) {
+            selected_rulesES.push(
+                rulesGr.getValue("correlation_rule_name")
+            );
+
+        }
+        return selected_rulesES;
+    },
+
+    _getCorrelationRuleNameFromAlert: function(sampletype) {
+        gs.debug("Invoking _getCorrelationRuleNameFromAlert with inputs: {0}", [sampletype]);
+        var rule = new GlideRecord(this.CORRELATION_RULES_TABLE);
+        rule.addQuery('sys_id', sampletype);
+        rule.query();
+        if (rule.next())
+            return rule.getValue('correlation_rule_name');
+        else
+            return "";
+    },
+
+    _getEscapedCorrelationRuleName: function(correlationRuleName) {
+        gs.debug("Invoking _getEscapedCorrelationRuleName with inputs: {0}", [correlationRuleName]);
+        var regexForBackSlash = /\\/g;
+        var escapedCorrelationRuleName = correlationRuleName.replace(regexForBackSlash, "\\\\\\");
+        return escapedCorrelationRuleName;
+    },
+
+    _getCurrentCorrelationRule: function(profile) {
+        gs.debug("Invoking _getCurrentCorrelationRule with inputs: {0}", [this.JSONG.stringify(profile)]);
+        var gr = new GlideRecord(this.CORRELATION_RULES_TABLE);
+        gr.get("correlation_rule_name", profile.alert_list);
+        return {
+            id: "" + gr.getUniqueValue(),
+            name: "" + gr.correlation_rule_name
+        };
+    },
+    _insertCorrelationRules: function(profile, CorrelationRules) {
+        gs.debug("Invoking _insertCorrelationRules with inputs: {0} {1}", [this.JSONG.stringify(profile), CorrelationRules]);
+        var profileId = profile.getUniqueValue();
+        var output = {};
+        var corRules = profile.correlation_rules_list;
+
+        var noCommaRules = [];
+        var commaRules = [];
+        for (var i = 0; i < CorrelationRules.length; i++) {
+            if (CorrelationRules[i].indexOf(',') > -1)
+                commaRules.push(CorrelationRules[i]);
+            else
+                noCommaRules.push(CorrelationRules[i]);
+        }
+
+        var gr = new GlideRecord(this.CORRELATION_RULES_TABLE);
+        gr.addQuery("profile", profileId);
+        gr.addQuery("correlation_rule_name", "NOT IN", noCommaRules);
+        for (var j = 0; j < commaRules.length; j++) {
+            gr.addQuery('correlation_rule_name', '!=', commaRules[j]);
+        }
+        if (!gs.nil(corRules))
+            gr.addQuery("sys_id", "NOT IN", corRules.split(','));
+        gr.query();
+        gr.deleteMultiple();
+        for (var key in CorrelationRules) {
+            var name = CorrelationRules[key];
+            gr.initialize();
+            gr.addQuery("correlation_rule_name", name);
+            gr.addQuery("profile", profileId);
+            gr.setLimit(1);
+            gr.query();
+            var id;
+            if (gr.next()) {
+                id = gr.getUniqueValue();
+            } else {
+                gr.initialize();
+                gr.setValue("correlation_rule_name", name);
+                gr.setValue("profile", profileId);
+                id = gr.insert();
+            }
+            output[id] = name;
+        }
+        return output;
+    },
+    /*
+     * parses events from raw xml and enqueues into the field import queue
+     * used to parse imported data from a file or source
+     * used: SplunkESPullSampleEvents
+     */
+    parseEvents: function(profile, raw, sid) {
+        gs.debug("Invoking parseEvents with inputs: {0} {1}", [this.JSONG.stringify(profile), sid]);
+        var events = this._parseEventsRaw(raw);
+        this._queueImport(profile, events);
+        return events;
+    },
+
+    /*
+     * This method gets the list of all splunk apps
+     */
+    refreshSplunkApps: function(profile) {
+        gs.debug("Invoking refreshSplunkApps with inputs: {0}", [profile]);
+        return this._refreshSplunkApps(profile);
+    },
+
+    _refreshSplunkApps: function(profile) {
+        gs.debug("Invoking _refreshSplunkApps with inputs: {0}", [profile]);
+        var api = this._getSplunkApi(profile);
+        try {
+            var body = api.getSplunkApps();
+            if (body) {
+                var apps = this._parseSplunkApps(body);
+
+                return {
+                    message: "success",
+                    apps: JSON.stringify(apps)
+                };
+            } else {
+                throw "Empty response body";
+            }
+        } catch (e) {
+            gs.error("Splunk ES: Error while fetching splunk apps for profile: {0} -> {1}", profile.name, e);
+            return {
+                message: "failure"
+            };
+        }
+    },
+
+    _parseSplunkApps: function(body) {
+        gs.debug("Invoking _parseSplunkApps with inputs: {0}", [body]);
+        var names = {};
+
+        if (!body) {
+            gs.debug("Input body is null or undefined. Returning empty names object.");
+            return names;
+        }
+        try {
+            var parsedBody = JSON.parse(body);
+            if (!parsedBody.entry || !Array.isArray(parsedBody.entry)) {
+                gs.debug("Parsed body does not have a valid 'entry' array. Returning empty names object.");
+                return names;
+            }
+            for (var i = 0; i < parsedBody.entry.length; i++) {
+                if (parsedBody.entry[i].name && parsedBody.entry[i].content && parsedBody.entry[i].content.label) {
+                    names[parsedBody.entry[i].name] = parsedBody.entry[i].content.label;
+                } else {
+                    gs.debug("Entry is missing required properties: {0}", [JSON.stringify(parsedBody.entry[i])]);
+                }
+            }
+        } catch (e) {
+            gs.debug("Error parsing JSON body: {0}", [e.message]);
+        }
+        return names;
+    },
+
+
+    type: 'SplunkESEventIngestionQueryAbstract'
+};]]></script>
+    <sys_class_name>sys_script_include</sys_class_name>
+    <sys_created_by>admin</sys_created_by>
+    <sys_created_on>2019-07-12 12:59:02</sys_created_on>
+    <sys_id>3067db120fa23300012db8a276767e90</sys_id>
+    <sys_mod_count>420</sys_mod_count>
+    <sys_name>SplunkESEventIngestionQueryAbstract</sys_name>
+    <sys_package display_value="Splunk ES Integration for Security Operations" source="sn_sec_splunkes">b603f357e556f300a36baaf2972ed766</sys_package>
+    <sys_policy/>
+    <sys_scope display_value="Splunk ES Integration for Security Operations">b603f357e556f300a36baaf2972ed766</sys_scope>
+    <sys_update_name>sys_script_include_3067db120fa23300012db8a276767e90</sys_update_name>
+    <sys_updated_by>admin</sys_updated_by>
+    <sys_updated_on>2025-05-20 01:27:13</sys_updated_on>
+  </sys_script_include>
+  <sys_es_latest_script action="INSERT_OR_UPDATE">
+    <id>3067db120fa23300012db8a276767e90</id>
+    <sys_created_by>admin</sys_created_by>
+    <sys_created_on>2025-04-08 11:15:55</sys_created_on>
+    <sys_id>906f065137b022101630287c24924bf8</sys_id>
+    <sys_mod_count>0</sys_mod_count>
+    <sys_updated_by>admin</sys_updated_by>
+    <sys_updated_on>2025-04-08 11:15:55</sys_updated_on>
+    <table>sys_script_include</table>
+    <use_es_latest>false</use_es_latest>
+  </sys_es_latest_script>
+</record_update>
